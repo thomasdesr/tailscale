@@ -1225,7 +1225,7 @@ func TestDNSConfigForNetmapForExitNodeConfigs(t *testing.T) {
 			peers:                peers,
 			dnsConfig:            &tailcfg.DNSConfig{Routes: stringifyRoutes(routes)},
 			wantDefaultResolvers: []*dnstype.Resolver{{Addr: exitDOH}},
-			wantRoutes:           nil,
+			wantRoutes:           routes,
 		},
 		{
 			name:                 "tsExit/routes/defaultResolver",
@@ -1233,7 +1233,7 @@ func TestDNSConfigForNetmapForExitNodeConfigs(t *testing.T) {
 			peers:                peers,
 			dnsConfig:            &tailcfg.DNSConfig{Routes: stringifyRoutes(routes), Resolvers: defaultResolvers},
 			wantDefaultResolvers: []*dnstype.Resolver{{Addr: exitDOH}},
-			wantRoutes:           nil,
+			wantRoutes:           routes,
 		},
 
 		// WireGuard exit nodes with DNS capabilities provide a "fallback" type
