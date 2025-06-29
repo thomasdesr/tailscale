@@ -700,9 +700,13 @@ func dnsConfigForNetmap(nm *netmap.NetworkMap, peers map[tailcfg.NodeID]tailcfg.
 		dcfg.DefaultResolvers = append(dcfg.DefaultResolvers, resolvers...)
 	}
 
-	// If we're using an exit node and that exit node is new enough (1.19.x+)
-	// to run a DoH DNS proxy, then send all our DNS traffic through it.
-	// However, we still preserve split DNS routes for specific domains.
+	// Select default DNS resolvers based on the current configuration:
+	// 1. If using an exit node that supports DoH DNS proxy (1.19.x+),
+	//	  use it as the default resolver (we're assuming the exit node
+	//    will get the same DNS configuration as this peer, and so should still
+	//    respect user intent)
+	// 2. Otherwise, if user-configured default resolvers are available, use them
+	// 3. Finally, if WireGuard exit node resolvers are availble, use them
 	if dohURL, ok := exitNodeCanProxyDNS(nm, peers, prefs.ExitNodeID()); ok {
 		addDefault([]*dnstype.Resolver{{Addr: dohURL}})
 	} else if len(nm.DNS.Resolvers) > 0 {
