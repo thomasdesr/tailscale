@@ -65,6 +65,9 @@ type derpProber struct {
 	// Optionally restrict probes to a single regionCodeOrID.
 	regionCodeOrID string
 
+	// Optional custom dialer configuration for binding to specific interface/IP.
+	dialConfig *DialConfig
+
 	// Probe class for fetching & updating the DERP map.
 	ProbeMap ProbeClass
 
@@ -151,6 +154,14 @@ func WithMeshKey(meshKey key.DERPMesh) DERPOpt {
 	}
 }
 
+// WithDialConfig sets a custom dialer configuration for binding to a specific
+// interface or source IP address.
+func WithDialConfig(dialConfig *DialConfig) DERPOpt {
+	return func(d *derpProber) {
+		d.dialConfig = dialConfig
+	}
+}
+
 // DERP creates a new derpProber.
 //
 // If derpMapURL is "local", the DERPMap is fetched via
@@ -159,7 +170,6 @@ func DERP(p *Prober, derpMapURL string, opts ...DERPOpt) (*derpProber, error) {
 	d := &derpProber{
 		p:          p,
 		derpMapURL: derpMapURL,
-		tlsProbeFn: TLS,
 		nodes:      make(map[string]*tailcfg.DERPNode),
 		probes:     make(map[string]*Probe),
 	}
@@ -169,6 +179,10 @@ func DERP(p *Prober, derpMapURL string, opts ...DERPOpt) (*derpProber, error) {
 	}
 	for _, o := range opts {
 		o(d)
+	}
+	// Set up probe functions that can access the dialConfig
+	d.tlsProbeFn = func(hostPort string, config *tls.Config) ProbeClass {
+		return TLSWithDialer(hostPort, config, d.dialConfig)
 	}
 	d.udpProbeFn = d.ProbeUDP
 	d.meshProbeFn = d.probeMesh
@@ -292,7 +306,7 @@ func (d *derpProber) probeMesh(from, to string) ProbeClass {
 			}
 
 			dm := d.lastDERPMap
-			return derpProbeNodePair(ctx, dm, fromN, toN, d.meshKey)
+			return derpProbeNodePair(ctx, dm, fromN, toN, d.meshKey, d.dialConfig)
 		},
 		Class:  "derp_mesh",
 		Labels: Labels{"derp_path": derpPath},
@@ -316,7 +330,7 @@ func (d *derpProber) probeBandwidth(from, to string, size int64) ProbeClass {
 			if err != nil {
 				return err
 			}
-			return derpProbeBandwidth(ctx, d.lastDERPMap, fromN, toN, size, &transferTimeSeconds, &totalBytesTransferred, d.bwTUNIPv4Prefix, d.meshKey)
+			return derpProbeBandwidth(ctx, d.lastDERPMap, fromN, toN, size, &transferTimeSeconds, &totalBytesTransferred, d.bwTUNIPv4Prefix, d.meshKey, d.dialConfig)
 		},
 		Class: "derp_bw",
 		Labels: Labels{
@@ -357,7 +371,7 @@ func (d *derpProber) probeQueuingDelay(from, to string, packetsPerSecond int, pa
 			if err != nil {
 				return err
 			}
-			return derpProbeQueuingDelay(ctx, d.lastDERPMap, fromN, toN, packetsPerSecond, packetTimeout, &packetsDropped, qdh, meshKey)
+			return derpProbeQueuingDelay(ctx, d.lastDERPMap, fromN, toN, packetsPerSecond, packetTimeout, &packetsDropped, qdh, meshKey, d.dialConfig)
 		},
 		Class:  "derp_qd",
 		Labels: Labels{"derp_path": derpPath},
@@ -376,15 +390,15 @@ func (d *derpProber) probeQueuingDelay(from, to string, packetsPerSecond int, pa
 // derpProbeQueuingDelay continuously sends data between two local DERP clients
 // connected to two DERP servers in order to measure queuing delays. From and to
 // can be the same server.
-func derpProbeQueuingDelay(ctx context.Context, dm *tailcfg.DERPMap, from, to *tailcfg.DERPNode, packetsPerSecond int, packetTimeout time.Duration, packetsDropped *expvar.Float, qdh *histogram, meshKey key.DERPMesh) (err error) {
+func derpProbeQueuingDelay(ctx context.Context, dm *tailcfg.DERPMap, from, to *tailcfg.DERPNode, packetsPerSecond int, packetTimeout time.Duration, packetsDropped *expvar.Float, qdh *histogram, meshKey key.DERPMesh, dialConfig *DialConfig) (err error) {
 	// This probe uses clients with isProber=false to avoid spamming the derper
 	// logs with every packet sent by the queuing delay probe.
-	fromc, err := newConn(ctx, dm, from, false, meshKey)
+	fromc, err := newConn(ctx, dm, from, false, meshKey, dialConfig)
 	if err != nil {
 		return err
 	}
 	defer fromc.Close()
-	toc, err := newConn(ctx, dm, to, false, meshKey)
+	toc, err := newConn(ctx, dm, to, false, meshKey, dialConfig)
 	if err != nil {
 		return err
 	}
@@ -637,7 +651,7 @@ func (d *derpProber) ProbeUDP(ipaddr string, port int) ProbeClass {
 
 	return ProbeClass{
 		Probe: func(ctx context.Context) error {
-			return derpProbeUDP(ctx, ipaddr, port)
+			return derpProbeUDP(ctx, ipaddr, port, d.dialConfig)
 		},
 		Class:  "derp_udp",
 		Labels: initLabels,
@@ -648,8 +662,14 @@ func (d *derpProber) skipRegion(region *tailcfg.DERPRegion) bool {
 	return d.regionCodeOrID != "" && region.RegionCode != d.regionCodeOrID && strconv.Itoa(region.RegionID) != d.regionCodeOrID
 }
 
-func derpProbeUDP(ctx context.Context, ipStr string, port int) error {
-	pc, err := net.ListenPacket("udp", ":0")
+func derpProbeUDP(ctx context.Context, ipStr string, port int, dialConfig *DialConfig) error {
+	listenAddr := ":0"
+	if dialConfig != nil {
+		listenAddr = dialConfig.GetUDPListenAddr()
+	}
+
+	lc := &net.ListenConfig{}
+	pc, err := lc.ListenPacket(ctx, "udp", listenAddr)
 	if err != nil {
 		return err
 	}
@@ -702,15 +722,15 @@ func derpProbeUDP(ctx context.Context, ipStr string, port int) error {
 // DERP clients connected to two DERP servers.If tunIPv4Address is specified,
 // probes will use a TCP connection over a TUN device at this address in order
 // to exercise TCP-in-TCP in similar fashion to TCP over Tailscale via DERP.
-func derpProbeBandwidth(ctx context.Context, dm *tailcfg.DERPMap, from, to *tailcfg.DERPNode, size int64, transferTimeSeconds, totalBytesTransferred *expvar.Float, tunIPv4Prefix *netip.Prefix, meshKey key.DERPMesh) (err error) {
+func derpProbeBandwidth(ctx context.Context, dm *tailcfg.DERPMap, from, to *tailcfg.DERPNode, size int64, transferTimeSeconds, totalBytesTransferred *expvar.Float, tunIPv4Prefix *netip.Prefix, meshKey key.DERPMesh, dialConfig *DialConfig) (err error) {
 	// This probe uses clients with isProber=false to avoid spamming the derper logs with every packet
 	// sent by the bandwidth probe.
-	fromc, err := newConn(ctx, dm, from, false, meshKey)
+	fromc, err := newConn(ctx, dm, from, false, meshKey, dialConfig)
 	if err != nil {
 		return err
 	}
 	defer fromc.Close()
-	toc, err := newConn(ctx, dm, to, false, meshKey)
+	toc, err := newConn(ctx, dm, to, false, meshKey, dialConfig)
 	if err != nil {
 		return err
 	}
@@ -740,13 +760,13 @@ func derpProbeBandwidth(ctx context.Context, dm *tailcfg.DERPMap, from, to *tail
 
 // derpProbeNodePair sends a small packet between two local DERP clients
 // connected to two DERP servers.
-func derpProbeNodePair(ctx context.Context, dm *tailcfg.DERPMap, from, to *tailcfg.DERPNode, meshKey key.DERPMesh) (err error) {
-	fromc, err := newConn(ctx, dm, from, true, meshKey)
+func derpProbeNodePair(ctx context.Context, dm *tailcfg.DERPMap, from, to *tailcfg.DERPNode, meshKey key.DERPMesh, dialConfig *DialConfig) (err error) {
+	fromc, err := newConn(ctx, dm, from, true, meshKey, dialConfig)
 	if err != nil {
 		return err
 	}
 	defer fromc.Close()
-	toc, err := newConn(ctx, dm, to, true, meshKey)
+	toc, err := newConn(ctx, dm, to, true, meshKey, dialConfig)
 	if err != nil {
 		return err
 	}
@@ -1144,7 +1164,7 @@ func derpProbeBandwidthTUN(ctx context.Context, transferTimeSeconds, totalBytesT
 	return nil
 }
 
-func newConn(ctx context.Context, dm *tailcfg.DERPMap, n *tailcfg.DERPNode, isProber bool, meshKey key.DERPMesh) (*derphttp.Client, error) {
+func newConn(ctx context.Context, dm *tailcfg.DERPMap, n *tailcfg.DERPNode, isProber bool, meshKey key.DERPMesh, dialConfig *DialConfig) (*derphttp.Client, error) {
 	// To avoid spamming the log with regular connection messages.
 	l := logger.Filtered(log.Printf, func(s string) bool {
 		return !strings.Contains(s, "derphttp.Client.Connect: connecting to")
@@ -1161,6 +1181,13 @@ func newConn(ctx context.Context, dm *tailcfg.DERPMap, n *tailcfg.DERPNode, isPr
 	})
 	dc.IsProber = isProber
 	dc.MeshKey = meshKey
+
+	// Set custom dialer if dialConfig is provided
+	if dialConfig != nil {
+		dialer := dialConfig.MakeDialer()
+		dc.SetURLDialer(dialer.DialContext)
+	}
+
 	err := dc.Connect(ctx)
 	if err != nil {
 		return nil, err

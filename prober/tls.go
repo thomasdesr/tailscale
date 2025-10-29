@@ -30,9 +30,14 @@ const letsEncryptStartedStaplingCRL int64 = 1746576000 // 2025-05-07 00:00:00 UT
 //
 // The TLS config is optional and may be nil.
 func TLS(hostPort string, config *tls.Config) ProbeClass {
+	return TLSWithDialer(hostPort, config, nil)
+}
+
+// TLSWithDialer returns a Probe that healthchecks a TLS endpoint using a custom dialer.
+func TLSWithDialer(hostPort string, config *tls.Config, dialConfig *DialConfig) ProbeClass {
 	return ProbeClass{
 		Probe: func(ctx context.Context) error {
-			return probeTLS(ctx, config, hostPort)
+			return probeTLS(ctx, config, hostPort, dialConfig)
 		},
 		Class: "tls",
 	}
@@ -44,14 +49,25 @@ func TLS(hostPort string, config *tls.Config) ProbeClass {
 func TLSWithIP(dialAddr netip.AddrPort, config *tls.Config) ProbeClass {
 	return ProbeClass{
 		Probe: func(ctx context.Context) error {
-			return probeTLS(ctx, config, dialAddr.String())
+			return probeTLS(ctx, config, dialAddr.String(), nil)
 		},
 		Class: "tls",
 	}
 }
 
-func probeTLS(ctx context.Context, config *tls.Config, dialHostPort string) error {
-	dialer := &tls.Dialer{Config: config}
+func probeTLS(ctx context.Context, config *tls.Config, dialHostPort string, dialConfig *DialConfig) error {
+	var netDialer *net.Dialer
+	if dialConfig != nil {
+		netDialer = dialConfig.MakeDialer()
+	} else {
+		netDialer = &net.Dialer{}
+	}
+
+	dialer := &tls.Dialer{
+		NetDialer: netDialer,
+		Config:    config,
+	}
+
 	conn, err := dialer.DialContext(ctx, "tcp", dialHostPort)
 	if err != nil {
 		return fmt.Errorf("connecting to %q: %w", dialHostPort, err)

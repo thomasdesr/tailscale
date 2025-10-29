@@ -50,6 +50,7 @@ var (
 	qdPacketsPerSecond = flag.Int("qd-packets-per-second", 0, "if greater than 0, queuing delay will be measured continuously using 260 byte packets (approximate size of a CallMeMaybe packet) sent at this rate per second")
 	qdPacketTimeout    = flag.Duration("qd-packet-timeout", 5*time.Second, "queuing delay packets arriving after this period of time from being sent are treated like dropped packets and don't count toward queuing delay timings")
 	regionCodeOrID     = flag.String("region-code", "", "probe only this region (e.g. 'lax' or '17'); if left blank, all regions will be probed")
+	bindAddr           = flag.String("bind", "", "network interface name or source IP address to bind all probe connections to (e.g. 'en0' or '192.168.1.100'); useful for bypassing VPN default routes")
 	meshPSKFile        = flag.String("mesh-psk-file", "", "if non-empty, path to file containing the mesh pre-shared key file. It must be 64 lowercase hexadecimal characters; whitespace is trimmed.")
 	secretsURL         = flag.String("secrets-url", "", "SETEC server URL for secrets retrieval of mesh key")
 	secretPrefix       = flag.String("secrets-path-prefix", "prod/derp", fmt.Sprintf("setec path prefix for \"%s\" secret for DERP mesh key", setecMeshKeyName))
@@ -68,6 +69,17 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to get mesh key: %v", err)
 	}
+
+	// Parse bind address/interface if specified
+	var dialConfig *prober.DialConfig
+	if *bindAddr != "" {
+		dialConfig, err = prober.NewDialConfig(*bindAddr)
+		if err != nil {
+			log.Fatalf("failed to parse bind address/interface %q: %v", *bindAddr, err)
+		}
+		log.Printf("Binding all probe connections to %q", *bindAddr)
+	}
+
 	opts := []prober.DERPOpt{
 		prober.WithMeshProbing(*meshInterval),
 		prober.WithSTUNProbing(*stunInterval),
@@ -80,6 +92,9 @@ func main() {
 	}
 	if *regionCodeOrID != "" {
 		opts = append(opts, prober.WithRegionCodeOrID(*regionCodeOrID))
+	}
+	if dialConfig != nil {
+		opts = append(opts, prober.WithDialConfig(dialConfig))
 	}
 	dp, err := prober.DERP(p, *derpMapURL, opts...)
 	if err != nil {

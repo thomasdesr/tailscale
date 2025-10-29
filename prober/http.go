@@ -19,15 +19,20 @@ const maxHTTPBody = 4 << 20 // MiB
 // response, and verifies that want is present in the response
 // body.
 func HTTP(url, wantText string) ProbeClass {
+	return HTTPWithDialer(url, wantText, nil)
+}
+
+// HTTPWithDialer returns a ProbeClass that healthchecks an HTTP URL using a custom dialer.
+func HTTPWithDialer(url, wantText string, dialConfig *DialConfig) ProbeClass {
 	return ProbeClass{
 		Probe: func(ctx context.Context) error {
-			return probeHTTP(ctx, url, []byte(wantText))
+			return probeHTTP(ctx, url, []byte(wantText), dialConfig)
 		},
 		Class: "http",
 	}
 }
 
-func probeHTTP(ctx context.Context, url string, want []byte) error {
+func probeHTTP(ctx context.Context, url string, want []byte, dialConfig *DialConfig) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return fmt.Errorf("constructing request: %w", err)
@@ -35,7 +40,12 @@ func probeHTTP(ctx context.Context, url string, want []byte) error {
 
 	// Get a completely new transport each time, so we don't reuse a
 	// past connection.
-	tr := http.DefaultTransport.(*http.Transport).Clone()
+	var tr *http.Transport
+	if dialConfig != nil {
+		tr = dialConfig.MakeHTTPTransport()
+	} else {
+		tr = http.DefaultTransport.(*http.Transport).Clone()
+	}
 	defer tr.CloseIdleConnections()
 	c := &http.Client{
 		Transport: tr,
