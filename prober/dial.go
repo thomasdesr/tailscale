@@ -16,6 +16,12 @@ import (
 type DialConfig struct {
 	// BindAddr is the local address to bind to. Can be nil for default behavior.
 	BindAddr net.Addr
+
+	// interfaceName, if non-empty, indicates we should bind to this interface
+	// by name using platform-specific socket options (SO_BINDTODEVICE on Linux,
+	// IP_BOUND_IF on macOS). This is preferred over IP-based binding as it
+	// handles interface address changes.
+	interfaceName string
 }
 
 // NewDialConfig creates a DialConfig from a bind specification string.
@@ -23,40 +29,45 @@ type DialConfig struct {
 // - An IP address (e.g., "192.168.1.100")
 // - A network interface name (e.g., "en0", "eth0")
 //
+// For interface names on supported platforms (Linux, macOS), uses platform-specific
+// socket options (SO_BINDTODEVICE, IP_BOUND_IF) for more robust binding.
+//
 // If spec is empty, returns nil (use default dialing).
 func NewDialConfig(spec string) (*DialConfig, error) {
 	if spec == "" {
 		return nil, nil
 	}
 
-	addr, err := resolveBindAddr(spec)
-	if err != nil {
-		return nil, err
-	}
-
-	return &DialConfig{BindAddr: addr}, nil
-}
-
-// resolveBindAddr resolves a bind specification to a net.Addr.
-// It tries to parse as an IP address first, then as an interface name.
-func resolveBindAddr(spec string) (net.Addr, error) {
-	// Try parsing as IP address
+	// Try parsing as IP address first
 	if ip := net.ParseIP(spec); ip != nil {
-		if ip.To4() != nil {
-			return &net.TCPAddr{IP: ip}, nil
-		}
-		return &net.TCPAddr{IP: ip}, nil
+		return &DialConfig{
+			BindAddr: &net.TCPAddr{IP: ip},
+		}, nil
 	}
 
-	// Treat as interface name and resolve to IP
+	// Must be an interface name - verify it exists and get an IP for UDP binding
 	iface, err := net.InterfaceByName(spec)
 	if err != nil {
 		return nil, fmt.Errorf("invalid bind spec %q: not an IP address and interface not found: %w", spec, err)
 	}
 
+	// Get an IP address for fallback UDP binding (some platforms don't support Control on UDP)
+	addr, err := getInterfaceAddr(iface)
+	if err != nil {
+		return nil, err
+	}
+
+	return &DialConfig{
+		BindAddr:      addr,
+		interfaceName: spec, // Store the interface name for platform-specific binding
+	}, nil
+}
+
+// getInterfaceAddr returns the first suitable IP address from an interface.
+func getInterfaceAddr(iface *net.Interface) (net.Addr, error) {
 	addrs, err := iface.Addrs()
 	if err != nil {
-		return nil, fmt.Errorf("getting addresses for interface %q: %w", spec, err)
+		return nil, fmt.Errorf("getting addresses for interface %q: %w", iface.Name, err)
 	}
 
 	// Prefer IPv4, then IPv6
@@ -86,23 +97,32 @@ func resolveBindAddr(spec string) (net.Addr, error) {
 		return &net.TCPAddr{IP: ipv6Addr}, nil
 	}
 
-	return nil, fmt.Errorf("no suitable IP address found on interface %q", spec)
+	return nil, fmt.Errorf("no suitable IP address found on interface %q", iface.Name)
 }
 
-// MakeDialer creates a net.Dialer configured with the bind address.
-func (dc *DialConfig) MakeDialer() *net.Dialer {
-	if dc == nil {
-		return &net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}
-	}
 
-	return &net.Dialer{
-		LocalAddr: dc.BindAddr,
+// MakeDialer creates a net.Dialer configured with the bind address.
+// If an interface name was specified, uses platform-specific socket options
+// for more robust binding (SO_BINDTODEVICE on Linux, IP_BOUND_IF on macOS).
+func (dc *DialConfig) MakeDialer() *net.Dialer {
+	d := &net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
+
+	if dc == nil {
+		return d
+	}
+
+	// If we have an interface name, use platform-specific binding
+	if dc.interfaceName != "" {
+		dc.setControlForInterface(d, dc.interfaceName)
+	} else if dc.BindAddr != nil {
+		// Otherwise use IP-based binding
+		d.LocalAddr = dc.BindAddr
+	}
+
+	return d
 }
 
 // MakeHTTPTransport creates an http.Transport configured with the bind address.
@@ -115,16 +135,22 @@ func (dc *DialConfig) MakeHTTPTransport() *http.Transport {
 }
 
 // MakeListenConfig creates a net.ListenConfig for UDP binding.
-// For UDP, we need to listen on the specific interface/address.
+// If an interface name was specified, uses platform-specific socket options
+// for more robust binding (SO_BINDTODEVICE on Linux, IP_BOUND_IF on macOS).
 func (dc *DialConfig) MakeListenConfig() *net.ListenConfig {
-	if dc == nil {
-		return &net.ListenConfig{}
-	}
-
 	lc := &net.ListenConfig{}
 
-	// Platform-specific control function will be added if needed
-	// For now, we'll use the address-based approach which is more portable
+	if dc == nil {
+		return lc
+	}
+
+	// If we have an interface name, use platform-specific binding
+	if dc.interfaceName != "" {
+		dc.setControlForInterfaceListenConfig(lc, dc.interfaceName)
+	}
+	// Note: For UDP, we still bind to a specific IP via GetUDPListenAddr()
+	// even when using interface-based binding, for maximum compatibility
+
 	return lc
 }
 

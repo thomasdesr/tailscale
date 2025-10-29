@@ -62,43 +62,6 @@ func TestNewDialConfig_IPAddress(t *testing.T) {
 	}
 }
 
-func TestResolveBindAddr(t *testing.T) {
-	tests := []struct {
-		name    string
-		spec    string
-		wantErr bool
-	}{
-		{
-			name:    "IPv4 address",
-			spec:    "192.168.1.100",
-			wantErr: false,
-		},
-		{
-			name:    "IPv6 address",
-			spec:    "::1",
-			wantErr: false,
-		},
-		{
-			name:    "invalid spec",
-			spec:    "not-an-ip-or-interface",
-			wantErr: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			addr, err := resolveBindAddr(tt.spec)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("resolveBindAddr(%q) error = %v, wantErr %v", tt.spec, err, tt.wantErr)
-				return
-			}
-			if !tt.wantErr && addr == nil {
-				t.Errorf("resolveBindAddr(%q) returned nil address", tt.spec)
-			}
-		})
-	}
-}
-
 func TestDialConfig_MakeDialer(t *testing.T) {
 	tests := []struct {
 		name string
@@ -109,11 +72,21 @@ func TestDialConfig_MakeDialer(t *testing.T) {
 			dc:   nil,
 		},
 		{
-			name: "with bind addr",
+			name: "with bind addr (IP-based)",
 			dc: &DialConfig{
 				BindAddr: &net.TCPAddr{
 					IP: net.ParseIP("192.168.1.100"),
 				},
+				interfaceName: "", // No interface name, just IP
+			},
+		},
+		{
+			name: "with interface name",
+			dc: &DialConfig{
+				BindAddr: &net.TCPAddr{
+					IP: net.ParseIP("192.168.1.100"),
+				},
+				interfaceName: "lo", // Has interface name for platform-specific binding
 			},
 		},
 	}
@@ -125,10 +98,17 @@ func TestDialConfig_MakeDialer(t *testing.T) {
 				t.Errorf("MakeDialer() returned nil")
 			}
 
-			// Check that LocalAddr is set correctly
-			if tt.dc != nil && tt.dc.BindAddr != nil {
+			// For IP-based binding (no interface name), LocalAddr should be set
+			if tt.dc != nil && tt.dc.interfaceName == "" && tt.dc.BindAddr != nil {
 				if dialer.LocalAddr == nil {
 					t.Errorf("MakeDialer() LocalAddr is nil when BindAddr was set")
+				}
+			}
+
+			// For interface-based binding, Control should be set
+			if tt.dc != nil && tt.dc.interfaceName != "" {
+				if dialer.Control == nil {
+					t.Errorf("MakeDialer() Control is nil when interfaceName was set")
 				}
 			}
 		})
