@@ -211,8 +211,8 @@ func testTCPDialFailsWithIsolatedTUN(t *testing.T, tunDev string) {
 
 	// Verify it's a timeout/network error, not something else
 	if !strings.Contains(err.Error(), "timeout") &&
-	   !strings.Contains(err.Error(), "network") &&
-	   !strings.Contains(err.Error(), "unreachable") {
+		!strings.Contains(err.Error(), "network") &&
+		!strings.Contains(err.Error(), "unreachable") {
 		t.Logf("Warning: unexpected error type (but still failed as expected): %v", err)
 	}
 }

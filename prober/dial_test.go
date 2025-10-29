@@ -127,22 +127,34 @@ func TestDialConfig_GetUDPListenAddr(t *testing.T) {
 			want: ":0",
 		},
 		{
-			name: "with IPv4",
+			name: "with IPv4 IP binding",
 			dc: &DialConfig{
 				BindAddr: &net.TCPAddr{
 					IP: net.ParseIP("192.168.1.100"),
 				},
+				interfaceName: "", // No interface name = IP binding
 			},
 			want: "192.168.1.100:0",
 		},
 		{
-			name: "with IPv6",
+			name: "with IPv6 IP binding",
 			dc: &DialConfig{
 				BindAddr: &net.TCPAddr{
 					IP: net.ParseIP("::1"),
 				},
+				interfaceName: "", // No interface name = IP binding
 			},
 			want: "[::1]:0",
+		},
+		{
+			name: "with interface binding (allows dual-stack)",
+			dc: &DialConfig{
+				BindAddr: &net.TCPAddr{
+					IP: net.ParseIP("192.168.1.100"),
+				},
+				interfaceName: "eth0", // Interface binding
+			},
+			want: ":0", // Returns :0 for dual-stack, Control handles binding
 		},
 	}
 

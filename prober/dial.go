@@ -100,7 +100,6 @@ func getInterfaceAddr(iface *net.Interface) (net.Addr, error) {
 	return nil, fmt.Errorf("no suitable IP address found on interface %q", iface.Name)
 }
 
-
 // MakeDialer creates a net.Dialer configured with the bind address.
 // If an interface name was specified, uses platform-specific socket options
 // for more robust binding (SO_BINDTODEVICE on Linux, IP_BOUND_IF on macOS).
@@ -137,6 +136,10 @@ func (dc *DialConfig) MakeHTTPTransport() *http.Transport {
 // MakeListenConfig creates a net.ListenConfig for UDP binding.
 // If an interface name was specified, uses platform-specific socket options
 // for more robust binding (SO_BINDTODEVICE on Linux, IP_BOUND_IF on macOS).
+//
+// Note: When using interface binding, GetUDPListenAddr() returns ":0" to allow
+// dual-stack (IPv4/IPv6) operation. The Control function handles the actual
+// interface binding.
 func (dc *DialConfig) MakeListenConfig() *net.ListenConfig {
 	lc := &net.ListenConfig{}
 
@@ -148,16 +151,31 @@ func (dc *DialConfig) MakeListenConfig() *net.ListenConfig {
 	if dc.interfaceName != "" {
 		dc.setControlForInterfaceListenConfig(lc, dc.interfaceName)
 	}
-	// Note: For UDP, we still bind to a specific IP via GetUDPListenAddr()
-	// even when using interface-based binding, for maximum compatibility
 
 	return lc
 }
 
 // GetUDPListenAddr returns the address to use for UDP ListenPacket.
 // This is used for STUN probes.
+//
+// For interface binding, returns ":0" to allow dual-stack (IPv4/IPv6) operation.
+// The actual interface binding is handled by the Control function.
+//
+// For IP binding, returns the specific IP to bind to.
 func (dc *DialConfig) GetUDPListenAddr() string {
-	if dc == nil || dc.BindAddr == nil {
+	if dc == nil {
+		return ":0"
+	}
+
+	// If using interface binding, don't bind to a specific IP
+	// Let the Control function (SO_BINDTODEVICE/IP_BOUND_IF) handle it
+	// This allows dual-stack operation (both IPv4 and IPv6)
+	if dc.interfaceName != "" {
+		return ":0"
+	}
+
+	// For IP-based binding, bind to the specific IP
+	if dc.BindAddr == nil {
 		return ":0"
 	}
 
