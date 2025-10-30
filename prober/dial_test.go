@@ -72,21 +72,15 @@ func TestDialConfig_MakeDialer(t *testing.T) {
 			dc:   nil,
 		},
 		{
-			name: "with bind addr (IP-based)",
+			name: "with IP binding",
 			dc: &DialConfig{
-				BindAddr: &net.TCPAddr{
-					IP: net.ParseIP("192.168.1.100"),
-				},
-				interfaceName: "", // No interface name, just IP
+				bindIP: net.ParseIP("192.168.1.100"),
 			},
 		},
 		{
-			name: "with interface name",
+			name: "with interface binding",
 			dc: &DialConfig{
-				BindAddr: &net.TCPAddr{
-					IP: net.ParseIP("192.168.1.100"),
-				},
-				interfaceName: "lo", // Has interface name for platform-specific binding
+				bindInterface: "lo",
 			},
 		},
 	}
@@ -98,17 +92,17 @@ func TestDialConfig_MakeDialer(t *testing.T) {
 				t.Errorf("MakeDialer() returned nil")
 			}
 
-			// For IP-based binding (no interface name), LocalAddr should be set
-			if tt.dc != nil && tt.dc.interfaceName == "" && tt.dc.BindAddr != nil {
+			// For IP-based binding, LocalAddr should be set
+			if tt.dc != nil && tt.dc.isIPBinding() {
 				if dialer.LocalAddr == nil {
-					t.Errorf("MakeDialer() LocalAddr is nil when BindAddr was set")
+					t.Errorf("MakeDialer() LocalAddr is nil when IP binding was set")
 				}
 			}
 
 			// For interface-based binding, Control should be set
-			if tt.dc != nil && tt.dc.interfaceName != "" {
+			if tt.dc != nil && tt.dc.isInterfaceBinding() {
 				if dialer.Control == nil {
-					t.Errorf("MakeDialer() Control is nil when interfaceName was set")
+					t.Errorf("MakeDialer() Control is nil when interface binding was set")
 				}
 			}
 		})
@@ -129,30 +123,21 @@ func TestDialConfig_GetUDPListenAddr(t *testing.T) {
 		{
 			name: "with IPv4 IP binding",
 			dc: &DialConfig{
-				BindAddr: &net.TCPAddr{
-					IP: net.ParseIP("192.168.1.100"),
-				},
-				interfaceName: "", // No interface name = IP binding
+				bindIP: net.ParseIP("192.168.1.100"),
 			},
 			want: "192.168.1.100:0",
 		},
 		{
 			name: "with IPv6 IP binding",
 			dc: &DialConfig{
-				BindAddr: &net.TCPAddr{
-					IP: net.ParseIP("::1"),
-				},
-				interfaceName: "", // No interface name = IP binding
+				bindIP: net.ParseIP("::1"),
 			},
 			want: "[::1]:0",
 		},
 		{
-			name: "with interface binding (allows dual-stack)",
+			name: "with interface binding (dual-stack)",
 			dc: &DialConfig{
-				BindAddr: &net.TCPAddr{
-					IP: net.ParseIP("192.168.1.100"),
-				},
-				interfaceName: "eth0", // Interface binding
+				bindInterface: "eth0",
 			},
 			want: ":0", // Returns :0 for dual-stack, Control handles binding
 		},
@@ -163,6 +148,62 @@ func TestDialConfig_GetUDPListenAddr(t *testing.T) {
 			got := tt.dc.GetUDPListenAddr()
 			if got != tt.want {
 				t.Errorf("GetUDPListenAddr() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestDialConfig_MutuallyExclusive verifies that only one binding mode is set at a time
+func TestDialConfig_MutuallyExclusive(t *testing.T) {
+	tests := []struct {
+		name          string
+		spec          string
+		wantIP        bool
+		wantInterface bool
+	}{
+		{
+			name:          "IP address",
+			spec:          "192.168.1.100",
+			wantIP:        true,
+			wantInterface: false,
+		},
+		{
+			name:          "IPv6 address",
+			spec:          "::1",
+			wantIP:        true,
+			wantInterface: false,
+		},
+		{
+			name:          "interface name",
+			spec:          "lo",
+			wantIP:        false,
+			wantInterface: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dc, err := NewDialConfig(tt.spec)
+			if err != nil {
+				t.Skipf("NewDialConfig(%q) failed: %v", tt.spec, err)
+			}
+
+			gotIP := dc.isIPBinding()
+			gotInterface := dc.isInterfaceBinding()
+
+			if gotIP != tt.wantIP {
+				t.Errorf("isIPBinding() = %v, want %v", gotIP, tt.wantIP)
+			}
+			if gotInterface != tt.wantInterface {
+				t.Errorf("isInterfaceBinding() = %v, want %v", gotInterface, tt.wantInterface)
+			}
+
+			// CRITICAL: Verify they are mutually exclusive
+			if gotIP && gotInterface {
+				t.Error("Both IP and Interface binding are true - should be mutually exclusive!")
+			}
+			if !gotIP && !gotInterface {
+				t.Error("Neither IP nor Interface binding are true - one must be set")
 			}
 		})
 	}

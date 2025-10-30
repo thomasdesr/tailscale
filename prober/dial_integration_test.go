@@ -279,19 +279,20 @@ func TestDialConfig_SO_BINDTODEVICE_IsSet(t *testing.T) {
 		t.Skipf("NewDialConfig('lo') failed: %v", err)
 	}
 
+	// Verify it's recognized as interface binding
+	if !dc.isInterfaceBinding() {
+		t.Error("Expected interface binding mode")
+		return
+	}
+
 	dialer := dc.MakeDialer()
 
 	if dialer.Control == nil {
-		t.Error("Dialer.Control is nil when interface name was specified - SO_BINDTODEVICE won't be set")
+		t.Error("Dialer.Control is nil when interface binding was specified - SO_BINDTODEVICE won't be set")
 		return
 	}
 
 	t.Log("Control function is set for interface binding")
-
-	// Verify it has the interface name stored
-	if dc.interfaceName != "lo" {
-		t.Errorf("interfaceName = %q, want 'lo'", dc.interfaceName)
-	}
 }
 
 // TestDialConfig_IPBinding_vs_InterfaceBinding compares the two binding methods
