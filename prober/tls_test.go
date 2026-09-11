@@ -18,8 +18,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"tailscale.com/tstest"
 )
 
 var leafCert = x509.Certificate{
@@ -119,7 +123,7 @@ func TestCertExpiration(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			cs := &tls.ConnectionState{PeerCertificates: []*x509.Certificate{tt.cert()}}
-			err := validateConnState(context.Background(), cs)
+			err := validateConnState(context.Background(), &crlCache{now: time.Now}, cs)
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Errorf("unexpected error %q; want %q", err, tt.wantErr)
 			}
@@ -129,9 +133,11 @@ func TestCertExpiration(t *testing.T) {
 
 type CRLServer struct {
 	crlBytes []byte
+	requests atomic.Int32 // total requests served
 }
 
 func (s *CRLServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.requests.Add(1)
 	if s.crlBytes == nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
@@ -186,10 +192,16 @@ func parseECKey(t *testing.T, pemPriv string) *ecdsa.PrivateKey {
 	return key
 }
 
-func TestCRL(t *testing.T) {
-	// Generate CA key and self-signed CA cert
-	caKey := parseECKey(t, someECDSAKey1)
+// crlTestPKI is a CA that can sign CRLs plus a leaf certificate it issued.
+type crlTestPKI struct {
+	caCert *x509.Certificate
+	caKey  *ecdsa.PrivateKey
+	leaf   *x509.Certificate
+}
 
+func newCRLTestPKI(t *testing.T) crlTestPKI {
+	t.Helper()
+	caKey := parseECKey(t, someECDSAKey1)
 	caTpl := issuerCertTpl
 	caTpl.BasicConstraintsValid = true
 	caTpl.IsCA = true
@@ -204,7 +216,6 @@ func TestCRL(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Issue a leaf cert signed by the CA
 	leaf := leafCert
 	leaf.SerialNumber = big.NewInt(20001)
 	leaf.SignatureAlgorithm = x509.ECDSAWithSHA256
@@ -214,10 +225,43 @@ func TestCRL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	leafCertParsed, err := x509.ParseCertificate(leafBytes)
+	leafParsed, err := x509.ParseCertificate(leafBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
+	return crlTestPKI{caCert: caCert, caKey: caKey, leaf: leafParsed}
+}
+
+// crl signs a CRL issued by the test CA revoking the given serials as of
+// thisUpdate. A zero nextUpdate (with a zero thisUpdate) omits the NextUpdate
+// field; such a CRL cannot carry revoked serials, since their RevocationTime
+// would be zero too.
+func (p crlTestPKI) crl(t *testing.T, thisUpdate, nextUpdate time.Time, revoked ...*big.Int) []byte {
+	t.Helper()
+	rl := x509.RevocationList{
+		SignatureAlgorithm: p.caCert.SignatureAlgorithm,
+		Issuer:             p.caCert.Subject,
+		ThisUpdate:         thisUpdate,
+		NextUpdate:         nextUpdate,
+		Number:             big.NewInt(1),
+	}
+	for _, serial := range revoked {
+		rl.RevokedCertificateEntries = append(rl.RevokedCertificateEntries, x509.RevocationListEntry{
+			SerialNumber:   serial,
+			RevocationTime: thisUpdate,
+			ReasonCode:     1, // Key compromise
+		})
+	}
+	b, err := x509.CreateRevocationList(rand.Reader, &rl, p.caCert, p.caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func TestCRL(t *testing.T) {
+	pki := newCRLTestPKI(t)
+	caCert, caKey, leafCertParsed := pki.caCert, pki.caKey, pki.leaf
 
 	// Catch no CRL set by Let's Encrypt date.
 	noCRLCert := leafCert
@@ -243,7 +287,7 @@ func TestCRL(t *testing.T) {
 	// Create a CRL that revokes the leaf cert using x509.CreateRevocationList
 	now := time.Now()
 	revoked := []x509.RevocationListEntry{{
-		SerialNumber:   leaf.SerialNumber,
+		SerialNumber:   leafCertParsed.SerialNumber,
 		RevocationTime: now,
 		ReasonCode:     1, // Key compromise
 	}}
@@ -325,7 +369,8 @@ func TestCRL(t *testing.T) {
 				crlServer.crlBytes = nil
 				tt.cert.CRLDistributionPoints = []string{}
 			}
-			err := validateConnState(context.Background(), cs)
+			// A fresh cache per subtest: the server swaps CRL bytes between them.
+			err := validateConnState(context.Background(), &crlCache{now: time.Now}, cs)
 
 			if err == nil && tt.wantErr == "" {
 				return
@@ -336,4 +381,157 @@ func TestCRL(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCRLCache(t *testing.T) {
+	pki := newCRLTestPKI(t)
+	start := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+
+	newServer := func(t *testing.T, s *CRLServer) *httptest.Server {
+		srv := httptest.NewServer(s)
+		t.Cleanup(srv.Close)
+		return srv
+	}
+	check := func(c *crlCache, srv *httptest.Server) error {
+		return c.checkCertCRL(context.Background(), srv.URL, pki.leaf, pki.caCert)
+	}
+	mustCheck := func(t *testing.T, c *crlCache, srv *httptest.Server) {
+		t.Helper()
+		if err := check(c, srv); err != nil {
+			t.Fatalf("checkCertCRL: %v", err)
+		}
+	}
+	wantRequests := func(t *testing.T, s *CRLServer, want int32) {
+		t.Helper()
+		if got := s.requests.Load(); got != want {
+			t.Errorf("CRL server saw %d requests; want %d", got, want)
+		}
+	}
+
+	t.Run("ReusedAcrossProbes", func(t *testing.T) {
+		clock := tstest.NewClock(tstest.ClockOpts{Start: start})
+		c := &crlCache{now: clock.Now}
+		s := &CRLServer{crlBytes: pki.crl(t, start, start.Add(7*24*time.Hour))}
+		srv := newServer(t, s)
+
+		for range 5 {
+			mustCheck(t, c, srv)
+			clock.Advance(15 * time.Second)
+		}
+		wantRequests(t, s, 1)
+	})
+
+	t.Run("RefetchedAfterRefreshInterval", func(t *testing.T) {
+		clock := tstest.NewClock(tstest.ClockOpts{Start: start})
+		c := &crlCache{now: clock.Now}
+		s := &CRLServer{crlBytes: pki.crl(t, start, start.Add(7*24*time.Hour))}
+		srv := newServer(t, s)
+
+		mustCheck(t, c, srv)
+		clock.Advance(crlRefreshInterval - time.Minute)
+		mustCheck(t, c, srv)
+		wantRequests(t, s, 1)
+
+		clock.Advance(2 * time.Minute)
+		mustCheck(t, c, srv)
+		wantRequests(t, s, 2)
+	})
+
+	t.Run("RefetchedAfterNextUpdate", func(t *testing.T) {
+		clock := tstest.NewClock(tstest.ClockOpts{Start: start})
+		c := &crlCache{now: clock.Now}
+		s := &CRLServer{crlBytes: pki.crl(t, start, start.Add(crlRefreshInterval/2))}
+		srv := newServer(t, s)
+
+		mustCheck(t, c, srv)
+		clock.Advance(crlRefreshInterval/2 - time.Minute)
+		mustCheck(t, c, srv)
+		wantRequests(t, s, 1)
+
+		clock.Advance(2 * time.Minute)
+		mustCheck(t, c, srv)
+		wantRequests(t, s, 2)
+	})
+
+	t.Run("ConcurrentCallersShareOneFetch", func(t *testing.T) {
+		clock := tstest.NewClock(tstest.ClockOpts{Start: start})
+		c := &crlCache{now: clock.Now}
+		s := &CRLServer{crlBytes: pki.crl(t, start, start.Add(7*24*time.Hour))}
+		srv := newServer(t, s)
+
+		var wg sync.WaitGroup
+		errs := make([]error, 8)
+		for i := range errs {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				errs[i] = check(c, srv)
+			}()
+		}
+		wg.Wait()
+		for i, err := range errs {
+			if err != nil {
+				t.Errorf("caller %d: %v", i, err)
+			}
+		}
+		wantRequests(t, s, 1)
+	})
+
+	t.Run("RevokedFromCache", func(t *testing.T) {
+		clock := tstest.NewClock(tstest.ClockOpts{Start: start})
+		c := &crlCache{now: clock.Now}
+		s := &CRLServer{crlBytes: pki.crl(t, start, start.Add(7*24*time.Hour), pki.leaf.SerialNumber)}
+		srv := newServer(t, s)
+
+		for range 3 {
+			err := check(c, srv)
+			if err == nil || !strings.Contains(err.Error(), "has been revoked on") {
+				t.Fatalf("unexpected error %q; want revoked", err)
+			}
+			clock.Advance(15 * time.Second)
+		}
+		wantRequests(t, s, 1)
+	})
+
+	t.Run("WrongIssuerNotCached", func(t *testing.T) {
+		clock := tstest.NewClock(tstest.ClockOpts{Start: start})
+		c := &crlCache{now: clock.Now}
+		s := &CRLServer{crlBytes: pki.crl(t, start, start.Add(7*24*time.Hour))}
+		srv := newServer(t, s)
+
+		// The leaf is not a CA, so it cannot have signed the CRL.
+		err := c.checkCertCRL(context.Background(), srv.URL, pki.leaf, pki.leaf)
+		if err == nil || !strings.Contains(err.Error(), "could not verify CRL signature") {
+			t.Fatalf("unexpected error %q; want signature failure", err)
+		}
+		wantRequests(t, s, 1)
+
+		mustCheck(t, c, srv)
+		wantRequests(t, s, 2)
+	})
+
+	t.Run("NoNextUpdateNotCached", func(t *testing.T) {
+		c := &crlCache{now: tstest.NewClock(tstest.ClockOpts{Start: start}).Now}
+		// CreateRevocationList omits a zero NextUpdate only when ThisUpdate
+		// is zero as well.
+		s := &CRLServer{crlBytes: pki.crl(t, time.Time{}, time.Time{})}
+		srv := newServer(t, s)
+
+		for range 3 {
+			mustCheck(t, c, srv)
+		}
+		wantRequests(t, s, 3)
+	})
+
+	t.Run("NilIssuerReturnsError", func(t *testing.T) {
+		c := &crlCache{now: tstest.NewClock(tstest.ClockOpts{Start: start}).Now}
+		s := &CRLServer{crlBytes: pki.crl(t, start, start.Add(7*24*time.Hour))}
+		srv := newServer(t, s)
+
+		err := c.checkCertCRL(context.Background(), srv.URL, pki.leaf, nil)
+		if err == nil || !strings.Contains(err.Error(), "not in presented chain") {
+			t.Fatalf("unexpected error %q; want missing issuer", err)
+		}
+		wantRequests(t, s, 0)
+	})
 }
